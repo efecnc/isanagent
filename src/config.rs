@@ -122,6 +122,26 @@ pub struct ExecutionHarnessConfig {
     /// so the agent can call `execution_job_result` without waiting for the user. Set to false for API-only or
     /// headless runs that must not auto-continue the reasoning loop.
     pub wake_on_job_terminal: Option<bool>,
+    /// Optional POSIX resource caps (`setrlimit`) for the **local** provider's model-code child.
+    /// Omitted/empty = no limits (current behavior). Unix-only; ignored on Windows.
+    pub limits: Option<ExecutionResourceLimitsConfig>,
+}
+
+/// Opt-in POSIX resource limits for model-authored code under the `local` execution provider
+/// (`[harness.execution.limits]`). Every key is optional; an unset key means "no limit". Lowering a
+/// limit needs no privileges. Applied only to the code child, never to uv provisioning. Unix-only.
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
+pub struct ExecutionResourceLimitsConfig {
+    /// `RLIMIT_AS` — max virtual address space, in **megabytes**.
+    pub address_space_mb: Option<u64>,
+    /// `RLIMIT_CPU` — max CPU time, in **seconds** (wall-clock timeout still applies separately).
+    pub cpu_seconds: Option<u64>,
+    /// `RLIMIT_NPROC` — max processes/threads for the child's real user id.
+    pub max_processes: Option<u64>,
+    /// `RLIMIT_FSIZE` — max size of any single file the child may create, in **megabytes**.
+    pub file_size_mb: Option<u64>,
+    /// `RLIMIT_NOFILE` — max number of open file descriptors.
+    pub open_files: Option<u64>,
 }
 
 /// Sub-agent / task harness. Disabled unless `[harness.subagents] enabled = true`.
@@ -898,6 +918,27 @@ impl AppConfig {
             .clamp(MIN, MAX)
     }
 
+    /// Resolve `[harness.execution.limits]` into the `local` provider's [`ResourceLimits`].
+    /// MB fields are converted to bytes (saturating). All-`None` when unconfigured (no limits).
+    pub fn execution_resource_limits(&self) -> crate::execution::ResourceLimits {
+        let Some(cfg) = self
+            .harness
+            .as_ref()
+            .and_then(|h| h.execution.as_ref())
+            .and_then(|e| e.limits.as_ref())
+        else {
+            return crate::execution::ResourceLimits::default();
+        };
+        let mb_to_bytes = |mb: u64| mb.saturating_mul(1024 * 1024);
+        crate::execution::ResourceLimits {
+            address_space_bytes: cfg.address_space_mb.map(mb_to_bytes),
+            cpu_seconds: cfg.cpu_seconds,
+            max_processes: cfg.max_processes,
+            file_size_bytes: cfg.file_size_mb.map(mb_to_bytes),
+            open_files: cfg.open_files,
+        }
+    }
+
     pub fn execution_max_wall_secs(&self) -> u64 {
         const DEFAULT: u64 = 3600;
         const MIN: u64 = 1;
@@ -1618,6 +1659,31 @@ python_executable = "python3"
         assert!(c.execution_provider_allowed("local"));
         assert!(!c.execution_provider_allowed("jupyter"));
         assert_eq!(c.execution_python_executable(), "python3");
+    }
+
+    #[test]
+    fn execution_resource_limits_parse_and_convert() {
+        // Unconfigured -> no limits.
+        let none: AppConfig = toml::from_str("[harness.execution]\nenabled = true\n").expect("parse");
+        assert!(!none.execution_resource_limits().any());
+
+        let s = r#"
+[harness.execution.limits]
+address_space_mb = 4096
+cpu_seconds = 1800
+max_processes = 256
+file_size_mb = 2
+open_files = 1024
+"#;
+        let c: AppConfig = toml::from_str(s).expect("parse");
+        let limits = c.execution_resource_limits();
+        // MB fields convert to bytes; counts/seconds pass through.
+        assert_eq!(limits.address_space_bytes, Some(4096 * 1024 * 1024));
+        assert_eq!(limits.file_size_bytes, Some(2 * 1024 * 1024));
+        assert_eq!(limits.cpu_seconds, Some(1800));
+        assert_eq!(limits.max_processes, Some(256));
+        assert_eq!(limits.open_files, Some(1024));
+        assert!(limits.any());
     }
 
     #[test]

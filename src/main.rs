@@ -1379,6 +1379,8 @@ async fn maybe_prompt_uv_requirements_install(
             .join(".system_generated")
             .join("uv")
             .join("envs"),
+        // Throwaway config used only to locate the uv-managed venv python; never spawns model code.
+        resource_limits: isanagent::execution::ResourceLimits::default(),
     };
     let Some(env_python) = isanagent::execution::uv_managed_env_python(&local_cfg) else {
         return;

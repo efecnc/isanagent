@@ -46,6 +46,7 @@ Optional keys (defaults are sensible if omitted):
 | `default_execution_timeout_secs` | Default wall clock when the model omits **`timeout_secs`** on **`execution_run`** / **`execution_run_background`** (default **600**, clamped to **`max_wall_secs`**). |
 | `max_output_bytes` | Max combined stdout+stderr per run (default 256 KiB). |
 | `max_sessions` | Max concurrent sessions (default 32). |
+| `[harness.execution.limits]` | Optional POSIX `setrlimit` caps for the **`local`** provider's model-code child (Unix only; ignored on Windows). See **Limits and safety**. |
 | `allowed_providers` | e.g. `["local"]`, `["jupyter"]`, `["ssh"]`, `["colab_mcp"]`; if empty or omitted, any implemented provider is allowed. |
 | `python_executable` | Required only when `local_python_runtime = "system"` (explicit host interpreter path/command). Ignored for UV-managed local runtime. For **SSH**, the remote interpreter is **`[harness.execution.ssh].remote_python`** (default `python3`). |
 | `local_python_mode` | **`repl`** (default, or any value other than the opt-outs below): one **local** Python interpreter per session. **`subprocess`**, **`fresh`**, **`stateless`**, **`one_shot`**, **`false`**, **`0`**: each **`execution_run`** starts a new **`python -u -`** process (no shared namespace). |
@@ -209,6 +210,29 @@ If you use **`[harness.subagents]`** with **`allowed_tools`**, include the execu
 - **`execution_cancel`** / **`execution_job_cancel`** use process kill / `taskkill` best effort on Windows.  
 - Background jobs are retained in memory for polling until evicted when the in-process registry is full (completed jobs are dropped oldest-first).  
 - Treat **`shell`** mode like **`exec`**: only enable paths and prompts you trust.
+
+### Resource limits (`local` provider, Unix only)
+
+Opt-in POSIX `setrlimit` caps for the **model-authored code child** of the `local` provider — a coarse backstop against runaway training/RL code (out-of-memory, fork bombs, fd exhaustion, runaway disk) on top of the wall-clock timeout. **Off by default** (no limits), applied **only** to the code child (never to uv `pip install`), and **ignored on Windows**. Lowering a limit needs no privileges.
+
+```toml
+[harness.execution.limits]
+address_space_mb = 4096   # RLIMIT_AS  — max virtual memory (MB)
+cpu_seconds      = 1800   # RLIMIT_CPU — max CPU seconds (separate from the wall-clock timeout)
+max_processes    = 256    # RLIMIT_NPROC — max processes/threads for the child's user
+file_size_mb     = 2048   # RLIMIT_FSIZE — max single-file size the child may write (MB)
+open_files       = 1024   # RLIMIT_NOFILE — max open file descriptors
+```
+
+Any key may be omitted (that limit stays unset). Caps are applied **best-effort**: a value above the inherited hard limit can't be raised by an unprivileged child, so it's left at the inherited limit (and logged once at startup) rather than failing the run.
+
+**This is NOT sandboxing or isolation.** `setrlimit` only caps resource *quantities*. It gives no filesystem isolation, no network/egress control, no syscall filtering, and no namespacing — model code still has full workspace/host filesystem access (within OS permissions), full network, and sees the forwarded host environment (including any secrets/API keys). Use OS-level isolation (containers, namespaces, seccomp, network policy) for real confinement; these limits only bound *how much* a runaway consumes, not *what* it can reach.
+
+Per-limit caveats worth understanding before you rely on them:
+
+- **`address_space_mb` (RLIMIT_AS) is not an RSS/OOM limit.** It caps *virtual* address space; CUDA/PyTorch/mmap'd datasets reserve huge virtual ranges that are never resident, so a tight value crashes legitimate GPU/ML jobs while a safe value is too high to be a meaningful OOM backstop. For real memory limiting, prefer a cgroup (`systemd` `MemoryMax=`).
+- **`max_processes` (RLIMIT_NPROC) is per real-UID, system-wide**, not per-run — it counts every process owned by the agent's user. Run the agent as a dedicated UID, or use cgroup `pids.max` for a precise per-run cap.
+- **`cpu_seconds` (RLIMIT_CPU) is per process**, not tree-wide; a child that forks workers gets the budget per worker. The wall-clock `timeout_secs` remains the only tree-wide time bound.
 
 ## Terminal UI
 

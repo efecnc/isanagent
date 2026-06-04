@@ -311,6 +311,7 @@ fn try_build_provider(
                     .join(".system_generated")
                     .join("uv")
                     .join("envs"),
+                resource_limits: config.execution_resource_limits(),
             };
             let p = LocalExecutionProvider::new(lc).map_err(|e: ExecutionError| e.to_string())?;
             Ok((Arc::new(p), None))

@@ -63,6 +63,110 @@ pub struct LocalExecutionConfig {
     pub uv_env_root: PathBuf,
     /// Workspace root for log files.
     pub workspace_dir: PathBuf,
+    /// Optional POSIX resource limits applied to the model-authored code child. All-`None` by
+    /// default (no limits). Unix-only; ignored on Windows. NOT applied to uv provisioning.
+    pub resource_limits: ResourceLimits,
+}
+
+/// Optional POSIX `setrlimit` caps applied (in `pre_exec`) to the **model-authored code child
+/// only** — never to uv provisioning, whose `pip install` legitimately needs memory/processes. All
+/// `None` by default (no limits); a `Some(v)` sets both the soft and hard limit to `v`. Lowering a
+/// limit always succeeds for an unprivileged process, so this needs no extra capabilities. Unix
+/// only — ignored on Windows. A coarse backstop against runaway training/RL code (OOM, fork bombs,
+/// fd exhaustion, runaway disk), complementing the existing wall-clock timeout.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ResourceLimits {
+    /// `RLIMIT_AS` — max virtual address space, in bytes.
+    pub address_space_bytes: Option<u64>,
+    /// `RLIMIT_CPU` — max CPU time, in seconds.
+    pub cpu_seconds: Option<u64>,
+    /// `RLIMIT_NPROC` — max processes/threads for the child's real user id.
+    pub max_processes: Option<u64>,
+    /// `RLIMIT_FSIZE` — max size of any single file the child may create, in bytes.
+    pub file_size_bytes: Option<u64>,
+    /// `RLIMIT_NOFILE` — max number of open file descriptors.
+    pub open_files: Option<u64>,
+}
+
+impl ResourceLimits {
+    /// True when at least one limit is set, so the spawn path can skip the `pre_exec` work entirely
+    /// when nothing is configured.
+    pub fn any(&self) -> bool {
+        self.address_space_bytes.is_some()
+            || self.cpu_seconds.is_some()
+            || self.max_processes.is_some()
+            || self.file_size_bytes.is_some()
+            || self.open_files.is_some()
+    }
+}
+
+/// Apply the configured `setrlimit` caps **best-effort**. **Must only be called inside `pre_exec`**
+/// (post-fork, pre-exec): every call here is async-signal-safe (`setrlimit` only; no alloc/lock).
+///
+/// A failure to set one cap (most plausibly a value *above* the inherited hard limit, which an
+/// unprivileged process can't raise) is **ignored** rather than aborting the spawn — resource
+/// limiting is advisory hardening, not a correctness gate, so a mis-sized value must not brick every
+/// run in the session. The parent side (`warn_unenforceable_limits`) logs such cases at startup so
+/// they aren't silent.
+#[cfg(unix)]
+fn apply_resource_limits(limits: &ResourceLimits) {
+    // SAFETY: `setrlimit` is async-signal-safe; no allocation or locking occurs here.
+    unsafe {
+        macro_rules! cap {
+            ($res:expr, $val:expr) => {{
+                if let Some(v) = $val {
+                    // Clamp to `rlim_t` so a >4 GiB byte value can't truncate on 32-bit targets
+                    // (no-op where `rlim_t` is u64, i.e. Linux/macOS).
+                    let clamped = v.min(libc::rlim_t::MAX as u64) as libc::rlim_t;
+                    let rl = libc::rlimit {
+                        rlim_cur: clamped,
+                        rlim_max: clamped,
+                    };
+                    let _ = libc::setrlimit($res, &rl);
+                }
+            }};
+        }
+        cap!(libc::RLIMIT_AS, limits.address_space_bytes);
+        cap!(libc::RLIMIT_CPU, limits.cpu_seconds);
+        cap!(libc::RLIMIT_NPROC, limits.max_processes);
+        cap!(libc::RLIMIT_FSIZE, limits.file_size_bytes);
+        cap!(libc::RLIMIT_NOFILE, limits.open_files);
+    }
+}
+
+/// Parent-side preflight: warn (once, at provider construction) about any configured cap that sits
+/// **above** the current hard limit. An unprivileged child can't raise a hard limit, so `setrlimit`
+/// would fail and the cap is applied best-effort (left at the inherited value). Logging it here —
+/// where logging is allowed, unlike inside `pre_exec` — keeps a mis-sized limit from being silent.
+#[cfg(unix)]
+fn warn_unenforceable_limits(limits: &ResourceLimits) {
+    macro_rules! check {
+        ($name:literal, $res:expr, $val:expr) => {{
+            if let Some(v) = $val {
+                let mut rl = libc::rlimit {
+                    rlim_cur: 0,
+                    rlim_max: 0,
+                };
+                // SAFETY: `getrlimit` into a stack `rlimit`; no aliasing.
+                if unsafe { libc::getrlimit($res, &mut rl) } == 0 && (v as u128) > (rl.rlim_max as u128)
+                {
+                    log::warn!(
+                        "[harness.execution.limits] {} = {} exceeds the current hard limit {}; an \
+                         unprivileged child can't raise it, so it is applied best-effort (left at \
+                         the inherited limit).",
+                        $name,
+                        v,
+                        rl.rlim_max
+                    );
+                }
+            }
+        }};
+    }
+    check!("address_space_mb", libc::RLIMIT_AS, limits.address_space_bytes);
+    check!("cpu_seconds", libc::RLIMIT_CPU, limits.cpu_seconds);
+    check!("max_processes", libc::RLIMIT_NPROC, limits.max_processes);
+    check!("file_size_mb", libc::RLIMIT_FSIZE, limits.file_size_bytes);
+    check!("open_files", libc::RLIMIT_NOFILE, limits.open_files);
 }
 
 impl LocalExecutionConfig {
@@ -85,6 +189,7 @@ impl LocalExecutionConfig {
             uv_requirements: Vec::new(),
             uv_env_root,
             workspace_dir,
+            resource_limits: ResourceLimits::default(),
         }
     }
 }
@@ -333,6 +438,11 @@ impl LocalExecutionProvider {
                 "sandbox_dir is not a directory: {}",
                 sandbox.display()
             )));
+        }
+
+        #[cfg(unix)]
+        if config.resource_limits.any() {
+            warn_unenforceable_limits(&config.resource_limits);
         }
 
         let mut caps = ProviderCapabilities::minimal("local");
@@ -650,10 +760,14 @@ impl ExecutionProvider for LocalExecutionProvider {
             #[cfg(unix)]
             {
                 use std::os::unix::process::CommandExt;
+                let rlimits = self.config.resource_limits;
                 unsafe {
-                    cmd.as_std_mut().pre_exec(|| {
+                    cmd.as_std_mut().pre_exec(move || {
                         if libc::setpgid(0, 0) != 0 {
                             return Err(std::io::Error::last_os_error());
+                        }
+                        if rlimits.any() {
+                            apply_resource_limits(&rlimits);
                         }
                         Ok(())
                     });
@@ -1255,5 +1369,70 @@ mod tests {
 
         prov.close_session(&h.id).await.unwrap();
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resource_limits_any_reports_configured() {
+        assert!(!ResourceLimits::default().any());
+        assert!(ResourceLimits {
+            open_files: Some(64),
+            ..Default::default()
+        }
+        .any());
+        assert!(ResourceLimits {
+            cpu_seconds: Some(10),
+            ..Default::default()
+        }
+        .any());
+    }
+
+    // Verify `setrlimit` actually takes effect in the spawned child by reading it back with
+    // `ulimit`. `ulimit -t` reports RLIMIT_CPU in seconds and `ulimit -n` reports RLIMIT_NOFILE as a
+    // count — both unit-unambiguous across platforms. Lowering a soft limit always succeeds for an
+    // unprivileged process.
+    #[cfg(unix)]
+    fn ulimit_in_child(flag: &str, limits: &ResourceLimits) -> String {
+        use std::os::unix::process::CommandExt;
+        let limits = *limits;
+        let mut cmd = StdCommand::new("sh");
+        cmd.arg("-c").arg(format!("ulimit {flag}"));
+        // SAFETY: `apply_resource_limits` is async-signal-safe (setrlimit only).
+        unsafe {
+            cmd.pre_exec(move || {
+                apply_resource_limits(&limits);
+                Ok(())
+            });
+        }
+        let out = cmd.output().expect("spawn sh");
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rlimit_cpu_is_applied_to_child() {
+        let limits = ResourceLimits {
+            cpu_seconds: Some(42),
+            ..Default::default()
+        };
+        assert_eq!(ulimit_in_child("-t", &limits), "42");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rlimit_nofile_is_applied_to_child() {
+        let limits = ResourceLimits {
+            open_files: Some(48),
+            ..Default::default()
+        };
+        assert_eq!(ulimit_in_child("-n", &limits), "48");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn no_limits_leaves_child_unrestricted() {
+        // With nothing configured, the child keeps the inherited (non-trivial) fd limit.
+        let out = ulimit_in_child("-n", &ResourceLimits::default());
+        // Either "unlimited" or a number well above our test caps — never our 48/16 sentinels.
+        assert!(out == "unlimited" || out.parse::<u64>().map(|n| n > 48).unwrap_or(false));
     }
 }
