@@ -8,6 +8,19 @@ use crate::utils::{ChatMessage, ToolCallRequest};
 struct ToolCallSignature {
     name: String,
     args_hash: String,
+    /// Hash of the arguments with every numeric literal collapsed to a constant, so calls that
+    /// differ *only* in a number (an incrementing offset/page, a single tweaked hyperparameter)
+    /// share a normalized signature. `args_hash` already distinguishes any two distinct argument
+    /// strings, so this field does not change exact `PartialEq`/`Hash` equality — it is consulted
+    /// only by the normalized detector via [`ToolCallSignature::norm_eq`].
+    norm_args_hash: String,
+}
+
+impl ToolCallSignature {
+    /// Same tool, same arguments once numeric literals are collapsed.
+    fn norm_eq(&self, other: &Self) -> bool {
+        self.name == other.name && self.norm_args_hash == other.norm_args_hash
+    }
 }
 
 fn hash_args(args: &str) -> String {
@@ -16,10 +29,23 @@ fn hash_args(args: &str) -> String {
     full.chars().take(12).collect()
 }
 
+/// Collapse numeric literals (`123`, `4.5`) to a constant so a loop that only varies a number —
+/// incrementing offsets, pagination, one tweaked hyperparameter — still normalizes to a repeat.
+/// Operates on the raw argument string, so it catches a number whether it lives in a structured
+/// arg or inside a path/query string, and needs no JSON parse.
+fn normalize_args(args: &str) -> String {
+    use std::sync::LazyLock;
+    static NUM_RE: LazyLock<regex::Regex> = LazyLock::new(|| {
+        regex::Regex::new(r"\d+(?:\.\d+)?").expect("static number regex compiles")
+    });
+    NUM_RE.replace_all(args, "0").into_owned()
+}
+
 fn signature(tc: &ToolCallRequest) -> ToolCallSignature {
     ToolCallSignature {
         name: tc.function.name.clone(),
         args_hash: hash_args(&tc.function.arguments),
+        norm_args_hash: hash_args(&normalize_args(&tc.function.arguments)),
     }
 }
 
@@ -54,6 +80,32 @@ fn detect_identical_consecutive(
     let mut count = 1usize;
     for i in 1..signatures.len() {
         if signatures[i] == signatures[i - 1] {
+            count += 1;
+            if count >= threshold {
+                return Some(signatures[i].name.as_str());
+            }
+        } else {
+            count = 1;
+        }
+    }
+    None
+}
+
+/// Like [`detect_identical_consecutive`] but compares the **numeric-normalized** signature, so a
+/// run that only varies a number (offset 0 → 100 → 200, page 1 → 2 → 3, a single tweaked
+/// hyperparameter) counts as a repeat. Intentionally separate from the exact detector and only used
+/// for the advisory nudge — never for hard-stop escalation — so legitimate bounded pagination is
+/// not killed.
+fn detect_identical_consecutive_normalized(
+    signatures: &[ToolCallSignature],
+    threshold: usize,
+) -> Option<&str> {
+    if signatures.len() < threshold {
+        return None;
+    }
+    let mut count = 1usize;
+    for i in 1..signatures.len() {
+        if signatures[i].norm_eq(&signatures[i - 1]) {
             count += 1;
             if count >= threshold {
                 return Some(signatures[i].name.as_str());
@@ -115,6 +167,21 @@ your arguments significantly, or explain what you are stuck on and ask for guida
         return Some(format!(
             "[SYSTEM: DOOM LOOP DETECTED] You are stuck in a repeating cycle of tool calls: \
 [{pattern_desc}]. STOP this cycle and try a fundamentally different approach."
+        ));
+    }
+    // Softer signal: same tool called repeatedly with only a numeric argument changing. A higher
+    // threshold than the exact detectors keeps this from firing on short, legitimate pagination,
+    // and the wording is non-coercive because intentional pagination is valid.
+    const NORM_THRESHOLD: usize = 4;
+    if let Some(tool_name) =
+        detect_identical_consecutive_normalized(&signatures, NORM_THRESHOLD)
+    {
+        return Some(format!(
+            "[SYSTEM: POSSIBLE LOOP] You have called '{tool_name}' several times in a row changing \
+only a numeric argument (e.g. an incrementing offset/page or one tweaked value). If you are \
+intentionally paginating or sweeping, continue — but if you expected different results and are not \
+making progress, STOP and try a fundamentally different approach (a different tool, a substantially \
+different query, or explain what you are stuck on)."
         ));
     }
     None
@@ -244,5 +311,60 @@ mod tests {
             assistant_with_tools(vec![b]),
         ];
         assert!(doom_loop_active_at_tail(&msgs));
+    }
+
+    fn paginate(offset: i32) -> ToolCallRequest {
+        tc("read_file", &format!(r#"{{"path":"x","offset":{offset}}}"#))
+    }
+
+    #[test]
+    fn normalized_numeric_loop_triggers_advisory() {
+        // Incrementing offset escapes the exact-hash detector but is caught by normalization.
+        let msgs = vec![
+            assistant_with_tools(vec![paginate(0)]),
+            assistant_with_tools(vec![paginate(100)]),
+            assistant_with_tools(vec![paginate(200)]),
+            assistant_with_tools(vec![paginate(300)]),
+        ];
+        let p = check_for_doom_loop_prompt(&msgs).expect("advisory");
+        assert!(p.contains("POSSIBLE LOOP"), "{p}");
+        assert!(p.contains("read_file"), "{p}");
+    }
+
+    #[test]
+    fn normalized_below_threshold_does_not_trigger() {
+        // Only 3 numeric-varied calls — under the (more conservative) normalized threshold of 4.
+        let msgs = vec![
+            assistant_with_tools(vec![paginate(0)]),
+            assistant_with_tools(vec![paginate(100)]),
+            assistant_with_tools(vec![paginate(200)]),
+        ];
+        assert!(check_for_doom_loop_prompt(&msgs).is_none());
+    }
+
+    #[test]
+    fn normalized_does_not_trigger_when_nonnumeric_args_differ() {
+        // Different paths (no shared numeric-only variation) must not look like a loop.
+        let msgs = vec![
+            assistant_with_tools(vec![tc("read_file", r#"{"path":"a"}"#)]),
+            assistant_with_tools(vec![tc("read_file", r#"{"path":"b"}"#)]),
+            assistant_with_tools(vec![tc("read_file", r#"{"path":"c"}"#)]),
+            assistant_with_tools(vec![tc("read_file", r#"{"path":"d"}"#)]),
+        ];
+        assert!(check_for_doom_loop_prompt(&msgs).is_none());
+    }
+
+    #[test]
+    fn numeric_loop_is_not_escalated_at_tail() {
+        // Escalation (hard stop) must stay exact-only so legitimate bounded pagination isn't killed:
+        // a numeric-varied loop nudges but is NOT active-at-tail.
+        let msgs = vec![
+            assistant_with_tools(vec![paginate(0)]),
+            assistant_with_tools(vec![paginate(100)]),
+            assistant_with_tools(vec![paginate(200)]),
+            assistant_with_tools(vec![paginate(300)]),
+        ];
+        assert!(check_for_doom_loop_prompt(&msgs).is_some());
+        assert!(!doom_loop_active_at_tail(&msgs));
     }
 }
