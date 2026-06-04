@@ -261,6 +261,87 @@ impl Tool for WriteFileTool {
     }
 }
 
+/// Outcome of the whitespace-tolerant fallback match used by `edit_file` when an exact
+/// `old_text` substring isn't present.
+enum FuzzyMatch {
+    /// No line-run matches even after trimming per-line whitespace.
+    None,
+    /// Exactly one matching line-run; the byte range in `content` to replace.
+    Unique(usize, usize),
+    /// More than one line-run matches after trimming — too risky to auto-apply.
+    Ambiguous,
+}
+
+/// `(start, end)` byte spans of each line in `s`, where `end` excludes the terminating `\n` **and a
+/// CRLF `\r`** (or `s.len()` for a final line without a trailing newline). Excluding the `\r` means a
+/// spliced replacement preserves the original `\r\n` (it lives in the bytes after the span), so a
+/// fuzzy edit on a CRLF file doesn't flip just the edited line to a bare `\n`. `\r`/`\n` are single
+/// ASCII bytes, so every boundary is a valid char boundary.
+fn line_spans(s: &str) -> Vec<(usize, usize)> {
+    let mut spans = Vec::new();
+    let mut start = 0usize;
+    let bytes = s.as_bytes();
+    for i in 0..bytes.len() {
+        if bytes[i] == b'\n' {
+            let end = if i > start && bytes[i - 1] == b'\r' {
+                i - 1
+            } else {
+                i
+            };
+            spans.push((start, end));
+            start = i + 1;
+        }
+    }
+    if start < s.len() {
+        spans.push((start, s.len()));
+    }
+    spans
+}
+
+/// Find a contiguous run of lines in `content` that equals `old_text` line-for-line after trimming
+/// leading/trailing whitespace on each line — the common case where the model's `old_text` has the
+/// right code but stale or mismatched indentation. Returns the byte range of the matched run so the
+/// caller can splice in `new_text` while preserving the file's surrounding newlines.
+///
+/// Requires a **unique** match: zero matches fall through to the exact-match error, and multiple
+/// matches return [`FuzzyMatch::Ambiguous`] rather than risk editing the wrong location. A purely
+/// blank `old_text` (all lines empty after trim) never fuzzy-matches.
+///
+/// Note: only trimmed line *content* is compared, so indentation depth is not validated — a unique
+/// trim-match at an unexpected nesting level is still accepted (the caller's success message asks
+/// the model to verify the resulting indentation).
+fn whitespace_tolerant_match(content: &str, old_text: &str) -> FuzzyMatch {
+    let trimmed_old: Vec<&str> = old_text.lines().map(str::trim).collect();
+    let k = trimmed_old.len();
+    if k == 0 || trimmed_old.iter().all(|l| l.is_empty()) {
+        return FuzzyMatch::None;
+    }
+
+    let spans = line_spans(content);
+    if k > spans.len() {
+        return FuzzyMatch::None;
+    }
+
+    let mut found: Option<(usize, usize)> = None;
+    for i in 0..=(spans.len() - k) {
+        let window_matches = (0..k).all(|j| {
+            let (s, e) = spans[i + j];
+            content[s..e].trim() == trimmed_old[j]
+        });
+        if window_matches {
+            if found.is_some() {
+                return FuzzyMatch::Ambiguous;
+            }
+            found = Some((spans[i].0, spans[i + k - 1].1));
+        }
+    }
+
+    match found {
+        Some((start, end)) => FuzzyMatch::Unique(start, end),
+        None => FuzzyMatch::None,
+    }
+}
+
 pub struct EditFileTool {
     pub workspace_dir: PathBuf,
     pub restrict_to_workspace: bool,
@@ -332,6 +413,33 @@ impl Tool for EditFileTool {
             fs::read_to_string(&actual_path).map_err(|e| format!("Error reading file: {}", e))?;
 
         if !content.contains(old_text) {
+            // Exact substring not present. For a single replacement, fall back to a
+            // whitespace/indentation-tolerant line match — the dominant "old_text not found"
+            // failure is stale indentation. A unique match is spliced in; an ambiguous one errors
+            // rather than risk editing the wrong place. `replace_all` keeps exact-only semantics.
+            if !replace_all {
+                match whitespace_tolerant_match(&content, old_text) {
+                    FuzzyMatch::Unique(start, end) => {
+                        let old_content = content.clone();
+                        let new_content =
+                            format!("{}{}{}", &content[..start], new_text, &content[end..]);
+                        fs::write(&actual_path, &new_content)
+                            .map_err(|e| format!("Error saving edits: {}", e))?;
+                        let diff = unified_diff_snippet(&old_content, &new_content);
+                        return Ok(format!(
+                            "Applied 1 replacement to {} (matched ignoring leading/trailing whitespace — verify the indentation is correct):\n\n{}",
+                            actual_path.display(),
+                            diff
+                        ));
+                    }
+                    FuzzyMatch::Ambiguous => {
+                        return Ok("Error: old_text not found exactly; a whitespace-insensitive match found multiple candidate locations. Add more surrounding context to make it unique.".to_string());
+                    }
+                    FuzzyMatch::None => {
+                        return Ok("Error: old_text not found in file.".to_string());
+                    }
+                }
+            }
             return Ok("Error: old_text not found in file.".to_string());
         }
 
@@ -2566,5 +2674,177 @@ mod python_run_tests {
         }
         assert!(out.contains("hello from python"));
         let _ = fs::remove_dir_all(&root);
+    }
+}
+
+#[cfg(test)]
+mod edit_fuzzy_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn ws_tolerant_matches_unique_with_stale_indentation() {
+        let content = "fn main() {\n        let x = 1;\n}\n";
+        // old_text has the right code but the wrong indentation.
+        match whitespace_tolerant_match(content, "let x = 1;") {
+            FuzzyMatch::Unique(s, e) => assert_eq!(&content[s..e], "        let x = 1;"),
+            _ => panic!("expected Unique"),
+        }
+    }
+
+    #[test]
+    fn ws_tolerant_is_ambiguous_when_line_repeats() {
+        let content = "a()\n    foo()\nb()\n        foo()\n";
+        assert!(matches!(
+            whitespace_tolerant_match(content, "foo()"),
+            FuzzyMatch::Ambiguous
+        ));
+    }
+
+    #[test]
+    fn ws_tolerant_none_for_real_miss_and_blank() {
+        let content = "alpha\nbeta\n";
+        assert!(matches!(
+            whitespace_tolerant_match(content, "gamma"),
+            FuzzyMatch::None
+        ));
+        // A purely blank old_text must never fuzzy-match.
+        assert!(matches!(
+            whitespace_tolerant_match(content, "   \n  "),
+            FuzzyMatch::None
+        ));
+    }
+
+    #[test]
+    fn ws_tolerant_multi_line_block_preserves_surrounding_newlines() {
+        let content = "header\n    if cond:\n        do_a()\nfooter\n";
+        match whitespace_tolerant_match(content, "if cond:\n    do_a()") {
+            FuzzyMatch::Unique(s, e) => {
+                assert_eq!(&content[s..e], "    if cond:\n        do_a()");
+                let spliced = format!("{}{}{}", &content[..s], "X", &content[e..]);
+                assert_eq!(spliced, "header\nX\nfooter\n");
+            }
+            _ => panic!("expected Unique"),
+        }
+    }
+
+    async fn run_edit(dir: &std::path::Path, file: &str, args: Value) -> String {
+        let tool = EditFileTool {
+            workspace_dir: dir.to_path_buf(),
+            restrict_to_workspace: false,
+        };
+        let mut a = args;
+        a["path"] = json!(file);
+        tool.execute(a).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn edit_file_applies_fuzzy_when_indentation_differs() {
+        let dir = std::env::temp_dir().join(format!("isanagent_edit_{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("a.py");
+        // File uses a TAB; the model's old_text uses spaces -> not an exact substring, so the
+        // whitespace-tolerant fallback is what makes this edit land (a very common real failure).
+        fs::write(&path, "def f():\n\treturn 1\n").unwrap();
+
+        let out = run_edit(
+            &dir,
+            "a.py",
+            json!({ "old_text": "    return 1", "new_text": "    return 2" }),
+        )
+        .await;
+        assert!(out.contains("Applied 1 replacement"), "out: {out}");
+        assert!(out.contains("ignoring leading/trailing whitespace"), "out: {out}");
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "def f():\n    return 2\n"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn edit_file_exact_match_still_takes_precedence() {
+        let dir = std::env::temp_dir().join(format!("isanagent_edit_{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("b.txt"), "exact target here\n").unwrap();
+        let out = run_edit(
+            &dir,
+            "b.txt",
+            json!({ "old_text": "exact target", "new_text": "replaced" }),
+        )
+        .await;
+        assert!(out.contains("Applied 1 replacement(s)"), "out: {out}");
+        assert!(!out.contains("ignoring leading/trailing whitespace"));
+        assert_eq!(
+            fs::read_to_string(dir.join("b.txt")).unwrap(),
+            "replaced here\n"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn edit_file_ambiguous_fuzzy_is_rejected() {
+        let dir = std::env::temp_dir().join(format!("isanagent_edit_{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        // Two tab-indented occurrences; old_text uses spaces so it isn't an exact substring of
+        // either, but trims to match both -> ambiguous, must not auto-edit.
+        fs::write(dir.join("c.rs"), "\tfoo();\nbar();\n\tfoo();\n").unwrap();
+        let out = run_edit(
+            &dir,
+            "c.rs",
+            json!({ "old_text": "    foo();", "new_text": "    baz();" }),
+        )
+        .await;
+        assert!(out.contains("candidate locations"), "out: {out}");
+        assert_eq!(
+            fs::read_to_string(dir.join("c.rs")).unwrap(),
+            "\tfoo();\nbar();\n\tfoo();\n"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ws_tolerant_crlf_splice_preserves_carriage_returns() {
+        let content = "alpha\r\n\tx = 1\r\nbeta\r\n";
+        match whitespace_tolerant_match(content, "x = 1") {
+            FuzzyMatch::Unique(s, e) => {
+                assert_eq!(&content[s..e], "\tx = 1"); // span excludes the trailing \r
+                let spliced = format!("{}{}{}", &content[..s], "x = 2", &content[e..]);
+                assert_eq!(spliced, "alpha\r\nx = 2\r\nbeta\r\n"); // CRLF preserved around the edit
+            }
+            _ => panic!("expected Unique"),
+        }
+    }
+
+    #[tokio::test]
+    async fn edit_file_fuzzy_preserves_crlf() {
+        let dir = std::env::temp_dir().join(format!("isanagent_edit_{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("w.txt"), "alpha\r\n\tx = 1\r\nbeta\r\n").unwrap();
+        let out = run_edit(
+            &dir,
+            "w.txt",
+            json!({ "old_text": "    x = 1", "new_text": "x = 2" }),
+        )
+        .await;
+        assert!(out.contains("Applied 1 replacement"), "out: {out}");
+        // The edited line keeps its CRLF rather than degrading to a lone \n.
+        assert_eq!(
+            fs::read_to_string(dir.join("w.txt")).unwrap(),
+            "alpha\r\nx = 2\r\nbeta\r\n"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ws_tolerant_handles_multibyte_content() {
+        // İ is 2 bytes, 🎉 is 4 bytes — byte-range splicing must not split a codepoint.
+        let content = "fn greet() {\n\tprintln!(\"İstanbul 🎉\");\n}\n";
+        match whitespace_tolerant_match(content, "println!(\"İstanbul 🎉\");") {
+            FuzzyMatch::Unique(s, e) => {
+                assert_eq!(&content[s..e], "\tprintln!(\"İstanbul 🎉\");");
+            }
+            _ => panic!("expected Unique"),
+        }
     }
 }
