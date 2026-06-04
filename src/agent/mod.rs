@@ -2780,7 +2780,13 @@ impl AgentLogic {
                                 persist_and_cancel!();
                             }
                         };
-                        let is_error = tool_result.is_err();
+                        // Truth, not just the dispatch `Result`: some tools report recoverable
+                        // failures in-band (`exec`/`python_run` non-zero `Exit code:`, the fs/search
+                        // tools' `Ok("Error: ...")`). Inspect the RAW `Ok` payload (the exit marker
+                        // sits at the tail and `finalize_tool_output` would truncate it away) so
+                        // `is_error` doesn't report success on a failed edit / non-zero command.
+                        let is_error =
+                            crate::utils::tool_call_is_error(&tc.function.name, &tool_result);
                         let tool_result_text = finalize_tool_output(tool_result);
                         let tool_name = tc.function.name.clone();
                         let tr = TelemetryEvent::ToolResult {
@@ -2884,7 +2890,13 @@ impl AgentLogic {
                             }
                         };
 
-                        let is_error = tool_result.is_err();
+                        // Truth, not just the dispatch `Result`: some tools report recoverable
+                        // failures in-band (`exec`/`python_run` non-zero `Exit code:`, the fs/search
+                        // tools' `Ok("Error: ...")`). Inspect the RAW `Ok` payload (the exit marker
+                        // sits at the tail and `finalize_tool_output` would truncate it away) so
+                        // `is_error` doesn't report success on a failed edit / non-zero command.
+                        let is_error =
+                            crate::utils::tool_call_is_error(&tc.function.name, &tool_result);
                         let tool_result_text = finalize_tool_output(tool_result);
 
                         let tr = TelemetryEvent::ToolResult {
