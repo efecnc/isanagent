@@ -3128,6 +3128,8 @@ impl Tool for LoadSkillTool {
             .unwrap_or("load");
 
         if action == "list" {
+            // Refresh first so skills authored during this session show up in discovery.
+            self.registry.scan_for_skills();
             return Ok(self.registry.format_skill_directory());
         }
 
@@ -3141,11 +3143,24 @@ impl Tool for LoadSkillTool {
             .and_then(|v| v.as_str())
             .unwrap_or("full");
 
-        if detail == "metadata" {
-            return self.registry.get_skill_metadata(skill_name);
-        }
+        let load = |name: &str| -> Result<String, String> {
+            if detail == "metadata" {
+                self.registry.get_skill_metadata(name)
+            } else {
+                self.registry.get_skill_instructions(name)
+            }
+        };
 
-        self.registry.get_skill_instructions(skill_name)
+        // On a miss (or a previously-unavailable skill), rescan once and retry: the skill may have
+        // been authored this session, or a dependency may have appeared. This makes self-authored
+        // skills usable without a restart.
+        match load(skill_name) {
+            Ok(s) => Ok(s),
+            Err(_) => {
+                self.registry.scan_for_skills();
+                load(skill_name)
+            }
+        }
     }
 }
 
@@ -4054,6 +4069,33 @@ mod tests {
         }]);
         assert_eq!(super::estimate_message_tokens(&msg), 100);
         assert_eq!(super::estimate_context_tokens(std::slice::from_ref(&msg)), 100);
+    }
+
+    #[tokio::test]
+    async fn load_skill_instructions_rescans_on_miss() {
+        use crate::traits::Tool;
+        let skills_temp = LocalTempDir::new();
+        let registry = Arc::new(SkillRegistry::new(skills_temp.path().clone()));
+        let tool = super::LoadSkillTool {
+            registry: registry.clone(),
+        };
+
+        // Author a skill AFTER the registry/tool were constructed (mid-session).
+        let skill_dir = skills_temp.path().join("fresh_skill");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: fresh_skill\ndescription: d\n---\n\nFRESH-BODY",
+        )
+        .unwrap();
+
+        // First lookup misses; the tool rescans and retries, finding the just-authored skill
+        // without a restart.
+        let out = tool
+            .execute(serde_json::json!({ "skill_name": "fresh_skill" }))
+            .await
+            .expect("rescan-on-miss should find the new skill");
+        assert!(out.contains("FRESH-BODY"), "got: {out}");
     }
 
     #[tokio::test]

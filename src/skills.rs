@@ -31,21 +31,35 @@ struct SkillFrontmatter {
 
 pub struct SkillRegistry {
     pub skills_dir: PathBuf,
-    skills: HashMap<String, SkillDefinition>,
+    /// Behind a `RwLock` so the set can be **rescanned on a shared `Arc<SkillRegistry>`** (see
+    /// [`scan_for_skills`](Self::scan_for_skills)) — skills authored mid-session become visible
+    /// without a restart. The lock is only ever held for synchronous map ops (no `.await`).
+    skills: std::sync::RwLock<HashMap<String, SkillDefinition>>,
 }
 
 impl SkillRegistry {
     pub fn new(skills_dir: PathBuf) -> Self {
-        let mut registry = Self {
+        let registry = Self {
             skills_dir,
-            skills: HashMap::new(),
+            skills: std::sync::RwLock::new(HashMap::new()),
         };
         registry.scan_for_skills();
         registry
     }
 
-    /// Scans the skills directory for folders containing a SKILL.md file.
-    pub fn scan_for_skills(&mut self) {
+    /// Read guard over the skill map, recovering from a poisoned lock rather than panicking (a
+    /// writer that panicked mid-scan must not take the whole registry down).
+    fn read_skills(&self) -> std::sync::RwLockReadGuard<'_, HashMap<String, SkillDefinition>> {
+        self.skills.read().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// (Re)scan the skills directory for folders containing a `SKILL.md` and **atomically replace**
+    /// the in-memory set. Takes `&self` so it can be called on a shared `Arc<SkillRegistry>` to pick
+    /// up skills the agent authored during a session (the `load_skill_instructions` tool calls this
+    /// on a miss). A fresh map is built first and then swapped in, so a transient read failure
+    /// leaves the existing set untouched and concurrent readers never observe a half-built state.
+    /// A full rebuild (rather than insert-only) also drops skills whose directory was removed.
+    pub fn scan_for_skills(&self) {
         if !self.skills_dir.exists() {
             return;
         }
@@ -55,6 +69,7 @@ impl SkillRegistry {
             Err(_) => return,
         };
 
+        let mut fresh = HashMap::new();
         for entry in entries.flatten() {
             let path = entry.path();
             if path.is_dir() {
@@ -67,11 +82,13 @@ impl SkillRegistry {
                         } else {
                             info!("Loaded Skill: {}", def.name);
                         }
-                        self.skills.insert(def.name.clone(), def);
+                        fresh.insert(def.name.clone(), def);
                     }
                 }
             }
         }
+
+        *self.skills.write().unwrap_or_else(|e| e.into_inner()) = fresh;
     }
 
     /// Parses a SKILL.md file extracting YAML frontmatter and the Markdown body.
@@ -160,14 +177,15 @@ impl SkillRegistry {
 
     /// Returns the metadata for progressive disclosure to the prompt
     pub fn get_capabilities_summary(&self) -> String {
-        if self.skills.is_empty() {
+        let skills = self.read_skills();
+        if skills.is_empty() {
             return String::new();
         }
 
         let mut summary = String::from("\n\nAvailable Agent Skills:\n");
         let mut always_blocks = String::new();
 
-        for skill in self.skills.values() {
+        for skill in skills.values() {
             if skill.always && skill.available {
                 always_blocks.push_str(&format!(
                     "\n--- SKILL AUTOMATICALLY LOADED: {} ---\n{}\n",
@@ -183,7 +201,7 @@ impl SkillRegistry {
     }
 
     pub fn get_skill_instructions(&self, name: &str) -> Result<String, String> {
-        match self.skills.get(name) {
+        match self.read_skills().get(name) {
             Some(skill) => {
                 if !skill.available {
                     return Err(format!(
@@ -198,19 +216,20 @@ impl SkillRegistry {
     }
 
     pub fn get_skill_names(&self) -> Vec<String> {
-        self.skills.keys().cloned().collect()
+        self.read_skills().keys().cloned().collect()
     }
 
     /// One line per skill for quick discovery (includes unavailable entries with their reason).
     pub fn format_skill_directory(&self) -> String {
-        if self.skills.is_empty() {
+        let skills = self.read_skills();
+        if skills.is_empty() {
             return "No skills discovered.".to_string();
         }
-        let mut names: Vec<_> = self.skills.keys().cloned().collect();
+        let mut names: Vec<_> = skills.keys().cloned().collect();
         names.sort();
         let mut out = String::from("Available skills:\n\n");
         for n in names {
-            if let Some(s) = self.skills.get(&n) {
+            if let Some(s) = skills.get(&n) {
                 out.push_str(&format!("- **{}**: {}\n", s.name, s.description));
             }
         }
@@ -219,8 +238,8 @@ impl SkillRegistry {
 
     /// Short metadata for a skill (no full instruction body).
     pub fn get_skill_metadata(&self, name: &str) -> Result<String, String> {
-        let skill = self
-            .skills
+        let skills = self.read_skills();
+        let skill = skills
             .get(name)
             .ok_or_else(|| format!("Skill '{}' not found", name))?;
         Ok(format!(
@@ -275,6 +294,46 @@ mod skill_metadata_tests {
 
         let dir_txt = reg.format_skill_directory();
         assert!(dir_txt.contains("demo_skill"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn write_skill(skills_dir: &std::path::Path, name: &str, body: &str) {
+        let skill_dir = skills_dir.join(name);
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        let mut f = std::fs::File::create(skill_dir.join("SKILL.md")).unwrap();
+        writeln!(f, "---\nname: {name}\ndescription: d\n---\n\n{body}").unwrap();
+    }
+
+    #[test]
+    fn rescan_picks_up_new_skill_and_drops_removed_one() {
+        let dir = std::env::temp_dir().join(format!(
+            "skill_reload_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Registry built before any skill exists -> empty, and crucially `&self` rescans work
+        // (the registry is shared as `Arc`, so this must not require `&mut`).
+        let reg = SkillRegistry::new(dir.clone());
+        assert!(reg.get_skill_instructions("authored").is_err());
+
+        // A skill authored after construction becomes visible on rescan (no restart).
+        write_skill(&dir, "authored", "BODY-A");
+        reg.scan_for_skills();
+        assert_eq!(
+            reg.get_skill_instructions("authored").unwrap().trim(),
+            "BODY-A"
+        );
+
+        // Removing the skill directory and rescanning drops it (full rebuild, not insert-only).
+        std::fs::remove_dir_all(dir.join("authored")).unwrap();
+        reg.scan_for_skills();
+        assert!(reg.get_skill_instructions("authored").is_err());
 
         let _ = std::fs::remove_dir_all(&dir);
     }
