@@ -27,16 +27,19 @@
         libssl3 \
         && rm -rf /var/lib/apt/lists/*
     
-    WORKDIR /app
-    
-    # copy binary
+    # copy binary (world-readable, on PATH)
     COPY --from=builder /app/target/release/isanagent /usr/local/bin/isanagent
-    
-    # non-root (optional but good)
-    # ARG UID=1000
-    # RUN useradd -u $UID -m appuser
-    
-    # RUN mkdir -p /app && chown appuser:appuser /app
-    # USER appuser
-    
+
+    # Run as a non-root user. The agent executes model-authored shell/Python, so running the
+    # container process as root needlessly widens the blast radius of a runaway command or a
+    # container escape. `-m` creates a home dir so the default workspace (`~/.isanagent`) and the
+    # first-run onboarding are writable without extra mounts. Override with `--build-arg UID=...`.
+    ARG UID=1000
+    RUN useradd -u ${UID} -m -s /bin/bash appuser
+    # Pin HOME explicitly: the default workspace resolves via `~/.isanagent` (shellexpand reads
+    # $HOME), so make the contract robust even if a caller overrides the entrypoint.
+    ENV HOME=/home/appuser
+    USER appuser
+    WORKDIR /home/appuser
+
     ENTRYPOINT ["isanagent"]
