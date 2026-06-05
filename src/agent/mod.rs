@@ -4130,6 +4130,7 @@ mod tests {
         max_iterations: usize,
         cancelled_before_start: bool,
         doom_loop_enabled: bool,
+        forbid_final_without_tools: bool,
     ) -> (Result<String, String>, Vec<ChatMessage>) {
         let memory_actor = SqliteMemoryActor::new(":memory:").expect("memory actor");
         let memory_node = NodeHandle::new(memory_actor, 16, 1, Duration::from_millis(1));
@@ -4175,7 +4176,7 @@ mod tests {
             subagent_allowlist: None,
             doom_loop_enabled,
             harness_runtime_summary: String::new(),
-            forbid_final_without_tools: false,
+            forbid_final_without_tools,
             shell_policy: Arc::new(crate::config::ResolvedShellPolicy {
                 interactive_mode: crate::config::ShellPolicyMode::Ask,
                 unattended_mode: crate::config::ShellPolicyMode::Deny,
@@ -4596,7 +4597,7 @@ mod tests {
     #[tokio::test]
     async fn run_reasoning_loop_persists_terminal_message_on_llm_failure() {
         let (result, context) =
-            run_loop_once_for_test(Box::new(NonTransientErrorProvider), 2, false, false).await;
+            run_loop_once_for_test(Box::new(NonTransientErrorProvider), 2, false, false, false).await;
         assert!(result.is_err(), "expected llm failure");
         let last = context.last().expect("last message");
         assert_eq!(last.role, "assistant");
@@ -4614,7 +4615,7 @@ mod tests {
     #[tokio::test]
     async fn run_reasoning_loop_persists_terminal_message_on_max_iterations() {
         let (result, context) =
-            run_loop_once_for_test(Box::new(DummyProvider), 0, false, false).await;
+            run_loop_once_for_test(Box::new(DummyProvider), 0, false, false, false).await;
         assert_eq!(
             result.expect("max iterations fallback"),
             "Agent reached max reasoning iterations."
@@ -4629,13 +4630,35 @@ mod tests {
         assert_eq!(text, "Agent reached max reasoning iterations.");
     }
 
+    // With forbid_final_without_tools on, a text-only model is nudged to keep
+    // calling tools. The nudge is now bounded (MAX_FORBID_FINAL_NUDGES): after
+    // the budget the model's answer is accepted instead of grinding to the cap.
+    #[tokio::test]
+    async fn forbid_final_accepts_text_after_nudge_budget() {
+        // max_iterations (10) is well above the nudge budget (3), so hitting the
+        // cap would only happen if the bound were missing.
+        let (result, _context) = run_loop_once_for_test(
+            Box::new(RespondingProvider {
+                tag: "here is my summary".to_string(),
+            }),
+            10,
+            false,
+            false,
+            true, // forbid_final_without_tools
+        )
+        .await;
+        let text = result.expect("terminal message");
+        assert_eq!(text, "here is my summary");
+        assert_ne!(text, "Agent reached max reasoning iterations.");
+    }
+
     // P1.4: a model that ignores the doom-loop nudges is hard-stopped with a "stuck" message
     // well before max_iterations, instead of spinning to the iteration cap.
     #[tokio::test]
     async fn doom_loop_escalates_to_hard_stop() {
         // max_iterations is high; the doom escalation should terminate the run much earlier.
         let (result, _context) =
-            run_loop_once_for_test(Box::new(IdenticalToolCallProvider), 50, false, true).await;
+            run_loop_once_for_test(Box::new(IdenticalToolCallProvider), 50, false, true, false).await;
         let msg = result.expect("terminal message");
         assert!(
             msg.starts_with("Stopped:") && msg.contains("repeating"),
@@ -4650,7 +4673,7 @@ mod tests {
     #[tokio::test]
     async fn doom_loop_disabled_runs_to_max_iterations() {
         let (result, _context) =
-            run_loop_once_for_test(Box::new(IdenticalToolCallProvider), 3, false, false).await;
+            run_loop_once_for_test(Box::new(IdenticalToolCallProvider), 3, false, false, false).await;
         assert_eq!(
             result.expect("terminal message"),
             "Agent reached max reasoning iterations."
@@ -4665,7 +4688,7 @@ mod tests {
         let provider = Box::new(CorrectingProvider {
             calls: Arc::new(AtomicUsize::new(0)),
         });
-        let (result, _context) = run_loop_once_for_test(provider, 8, false, true).await;
+        let (result, _context) = run_loop_once_for_test(provider, 8, false, true, false).await;
         assert_eq!(
             result.expect("terminal message"),
             "Agent reached max reasoning iterations.",
@@ -4711,7 +4734,7 @@ mod tests {
     #[tokio::test]
     async fn run_reasoning_loop_persists_terminal_message_on_cancel() {
         let (result, context) =
-            run_loop_once_for_test(Box::new(DummyProvider), 2, true, false).await;
+            run_loop_once_for_test(Box::new(DummyProvider), 2, true, false, false).await;
         assert_eq!(result.expect("cancelled run"), "");
         let last = context.last().expect("last message");
         assert_eq!(last.role, "assistant");
