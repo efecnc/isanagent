@@ -916,8 +916,7 @@ async fn execute_tool_call_with_activity(
                 ShellPolicyMode::Allow => {}
                 ShellPolicyMode::Deny => {
                     return ToolExecutionFinished::Completed(Err(
-                        "File edit blocked by policy: plan mode active — finalize or apply the plan first."
-                            .to_string(),
+                        "File edit blocked by the active permission policy.".to_string(),
                     ));
                 }
                 ShellPolicyMode::Ask => {

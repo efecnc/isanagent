@@ -515,6 +515,9 @@ impl Tool for EditFileTool {
             .get("replace_all")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
+        if old_text == new_text {
+            return Ok(None);
+        }
         let actual_path = resolve_path(path_str, &self.workspace_dir, self.restrict_to_workspace)?;
         let before = fs::read_to_string(&actual_path)
             .map_err(|error| format!("Could not preview edit target: {error}"))?;
